@@ -141,6 +141,88 @@
         - shell: "sudo yum install -y /usr/bin/createrepo"
         - shell: (cd dist/rpms; createrepo .)
 
+- builder:
+    name: create-ci-node-scripts
+    builders:
+      - shell: |
+          cat > ~/ci_node_scripts.sh <<END
+          ipaci-install-builddeps () {
+          DEPS=$(grep "^BuildRequires" freeipa.spec.in | awk '{ print $2 }' | grep -v "^/")
+          #
+          # Default to stuff in Fedora
+          sudo yum install -y rpm-build $DEPS --disablerepo updates-testing --skip-broken ||
+          #
+          # If there are problems, try updates-testing
+          sudo yum install -y rpm-build $DEPS --enablerepo updates-testing --skip-broken ||
+          #
+          # If there are problems, also try ipa-devel
+          sudo yum install -y rpm-build $DEPS --enablerepo updates-testing  --enablerepo ipa-devel --skip-broken
+          }
+          #
+          #
+          ipaci-install-rpms () {
+          # Default to stuff in Fedora
+          sudo yum install -y rpm-build "\$@" --disablerepo updates-testing --skip-broken ||
+          #
+          # If there are problems, try updates-testing
+          sudo yum install -y rpm-build "\$@" --enablerepo updates-testing --skip-broken ||
+          #
+          # If there are problems, also try ipa-devel
+          sudo yum install -y rpm-build "\$@" --enablerepo updates-testing  --enablerepo ipa-devel --skip-broken
+          }
+          #
+          #
+          ipaci-remove-rpms () {
+          rm -rvf /root/ipatests
+          mkdir -p /root/ipatests/rpms
+          }
+          END
+
+- builder:
+    name: setup-host
+    builders:
+      - shell: |
+          source ~/env.sh
+          # Set SSH options
+          export SSH_OPTS="-i $IPA_ROOT_SSH_KEY -o StrictHostKeyChecking=no"
+          # Copy ci-node-scripts over
+          scp $SSH_OPTS ~/ci_node_scripts.sh root@{host}:/root/ci_node_scripts.sh
+          # Remove rpms directory on the host
+          ssh $SSH_OPTS root@{host} <<END
+          PS4="+$(hostname)+"; set -ex
+          source /root/ci_node_scripts.sh
+          ipaci-remove-rpms
+          yum update -y
+          END
+          # Copy new rpms over
+          scp $SSH_OPTS dist/rpms/freeipa-*.rpm root@{host}:/root/ipatests/rpms
+          # Remove the old packages and install new
+          ssh $SSH_OPTS root@{host} <<END
+          PS4="+$(hostname)+"; set -ex
+          source /root/ci_node_scripts.sh
+          sudo yum remove -y 'freeipa-*' || :
+          ipaci-install-rpms /root/ipatests/rpms/freeipa-*.rpm bind-dyndb-ldap ntpdate
+          yum localinstall -y /root/slapi-nis-0.52-1.fc20.x86_64.rpm
+          rpm -qa | sort
+          END
+
+- builder:
+    name: cleanup-host
+    builders:
+      - shell: |
+          source ~/env.sh
+          # Set SSH options
+          export SSH_OPTS="-i $IPA_ROOT_SSH_KEY -o StrictHostKeyChecking=no"
+          # Copy ci-node-scripts over
+          scp $SSH_OPTS ~/ci_node_scripts.sh root@{host}:/root/ci_node_scripts.sh
+          # Uninstall IPA
+          ssh $SSH_OPTS root@{host} <<END
+          PS4="+$(hostname)+"; set -ex
+          source /root/ci_node_scripts.sh
+          ipa-server-install --uninstall -U
+          ipaci-remove-rpms
+          END
+
 - job-template:
     name: freeipa-build-{os}
     node: freeipa-builder-{os}
@@ -258,6 +340,32 @@
         - nosetests-xunit
         - mail-on-fail
 
+- job-template:
+    name: freeipa-adintegration-tests-{os}
+    node: freeipa-runner-{os}
+    defaults: global
+    description: |
+        Run all the AD integration related tests, out of tree.
+    wrappers:
+        - workspace-cleanup
+    builders:
+        - clean-up-environment
+        - install-built-rpms:
+            os: "{os}"
+        - setup-default-conf
+        - create-ci-node-scripts
+        - setup-host:
+            host: "$MASTER_env1"
+        - shell: |
+            source ~/env.sh
+            ipa-run-tests test_integration/test_trust.py --no-skip --with-xunit || :
+            ipa-test-config --global
+        - cleanup-host:
+            host: "$MASTER_env1"
+    publishers:
+        - nosetests-xunit
+        - mail-on-fail
+
 - job-group:
     name: build-and-check
     jobs:
@@ -265,8 +373,124 @@
         - freeipa-build-{os}
         - freeipa-check-deps-{os}
         - freeipa-intree-tests-{os}
+        - freeipa-adintegration-tests-{os}
         - freeipa-outoftree-tests-{os}
-
+        - freeipa-webui-{browser}-{os}-{prettyname}:
+            prettyname: with-dns-with-ca
+            noca: False
+            nodns: False
+            browser: firefox
+        - freeipa-webui-{browser}-{os}-{prettyname}:
+            prettyname: no-dns-no-ca
+            noca: True
+            nodns: True
+            browser: firefox
+            options-dns-setup: ""
+            options-ca-setup: >
+                --http_pkcs12 star-cert.p12 \
+                --dirsrv_pkcs12 star-cert.p12 \
+                --http_pin $FREEIPACI_STAR_CERT_PIN --dirsrv_pin $FREEIPACI_STAR_CERT_PIN \
+                --root-ca-file star-cert-ca.crt
+        - freeipa-integration-{os}-{pretty_name}:
+            pretty_name: caless
+            suite: test_integration/test_caless.py
+            config_template: |
+                domains:
+                  - hosts:
+                      - name: master.ipa.test
+                        role: master
+                      - name: replica.ipa.test
+                        role: replica
+                      - name: client.ipa.test
+                        role: client
+                    name: ipa.test
+                    type: IPA
+        - freeipa-integration-{os}-{pretty_name}:
+            pretty_name: simple_replication
+            suite: test_integration/test_simple_replication.py
+            config_template: |
+                domains:
+                  - hosts:
+                      - name: master.ipa.test
+                        role: master
+                      - name: replica.ipa.test
+                        role: replica
+                    name: ipa.test
+                    type: IPA
+        - freeipa-integration-{os}-{pretty_name}:
+            pretty_name: external_ca
+            suite: test_integration/test_external_ca.py
+            config_template: |
+                domains:
+                  - hosts:
+                      - name: master.ipa.test
+                        role: master
+                    name: ipa.test
+                    type: IPA
+        - freeipa-integration-{os}-{pretty_name}:
+            pretty_name: forced_client_reenrollment
+            suite: test_integration/test_forced_client_reenrollment.py
+            config_template: |
+                domains:
+                  - hosts:
+                      - name: master.ipa.test
+                        role: master
+                      - name: replica.ipa.test
+                        role: replica
+                      - name: client.ipa.test
+                        role: client
+                    name: ipa.test
+                    type: IPA
+        - freeipa-integration-{os}-{pretty_name}:
+            pretty_name: kerberos_flags
+            suite: test_integration/test_kerberos_flags.py
+            config_template: |
+                domains:
+                  - hosts:
+                      - name: master.ipa.test
+                        role: master
+                      - name: client.ipa.test
+                        role: client
+                    name: ipa.test
+                    type: IPA
+        - freeipa-integration-{os}-{pretty_name}:
+            pretty_name: basic_trust
+            suite: test_integration/test_trust.py
+            config_template: |
+                domains:
+                  - hosts:
+                      - name: master.ipa.test
+                        role: trust_master
+                    name: ipa.test
+                    type: TRUST_IPA
+                  - hosts:
+                      - name: ad
+                        role: ad
+                    name: ad.test
+                    type: AD
+        - freeipa-integration-{os}-{pretty_name}:
+            pretty_name: legacy_clients
+            suite: test_integration/test_legacy_clients.py
+            config_template: |
+                domains:
+                  - hosts:
+                      - name: master.ipa.test
+                        role: trust_master
+                      - name: legacy_client_sssd_redhat.ipa.test
+                        role: legacy_client_sssd_redhat
+                      - name: legacy_client_nss_ldap_redhat.ipa.test
+                        role: legacy_client_nss_ldap_redhat
+                      - name: legacy_client_nss_pam_ldapd_redhat.ipa.test
+                        role: legacy_client_nss_pam_ldapd_redhat
+                    name: ipa.test
+                    type: TRUST_IPA
+                  - hosts:
+                      - name: ad.ad.test
+                        role: ad
+                      - name: child.child.ad.test
+                        role: ad_subdomain
+                    name: ad.test
+                    type: AD
 - job-template:
     name: freeipa-stats-{os}
     node: freeipa-builder-{os}
